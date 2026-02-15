@@ -1,46 +1,61 @@
-# os
-Personal ParticleOS System Setup
+# YubiKey Secure Boot Signing for ParticleOS (macOS)
 
-ParticleOS Secure Boot Signing with YubiKey (macOS)
+This guide documents a practical, repo-aligned setup for using a YubiKey PIV key
+with `mkosi` Secure Boot signing in ParticleOS.
 
-This guide covers:
+It covers:
+- macOS tooling setup
+- ECC P-384 key generation
+- encrypted backup and restore
+- importing the same signing key into two YubiKeys
+- PKCS#11 checks
+- `mkosi.local.conf` settings used in this repository
+- hardened operational and recovery practices
 
-Installing required macOS tools
+## Trust model
 
-Generating an ECC P-384 signing key
+Use separate key roles:
+- `PK` (Platform Key): offline only
+- `KEK` (Key Exchange Key): offline only
+- `db` signing key (mkosi signing cert): YubiKey PIV slot `9c`
 
-Creating encrypted offline backup
+The YubiKey in this guide is only for the image-signing key (db-level signing).
+Do not store PK or KEK private keys on daily-use tokens.
 
-Importing the same key into two YubiKeys
+## Requirements (macOS)
 
-Verifying correctness
+Install required tools:
 
-Restoring from backup
-
-Confirming PKCS#11 works for mkosi
-
-Requirements (macOS)
-
-Install required tools via Homebrew:
-
+```sh
 brew install yubikey-manager opensc openssl
+```
 
+Verify tools:
 
-Verify installation:
-
+```sh
 ykman --version
 pkcs11-tool --version
 openssl version
+```
 
+Resolve OpenSC PKCS#11 module path:
 
-OpenSC PKCS#11 module path (Apple Silicon):
+```sh
+OPENSC_P11="$(brew --prefix opensc)/lib/opensc-pkcs11.so"
+test -f "$OPENSC_P11" && echo "$OPENSC_P11"
+```
 
+On Apple Silicon this is typically:
+
+```text
 /opt/homebrew/lib/opensc-pkcs11.so
+```
 
-1. Generate ECC P-384 Signing Key
+## Standard workflow
 
-We use secp384r1 (ECC P-384).
+### 1) Generate an ECC P-384 signing key
 
+```sh
 openssl genpkey \
   -algorithm EC \
   -pkeyopt ec_paramgen_curve:secp384r1 \
@@ -48,299 +63,214 @@ openssl genpkey \
   -out mkosi.key
 
 chmod 600 mkosi.key
+```
 
+Verify curve:
 
-Verify:
+```sh
+openssl pkey -in mkosi.key -text -noout | grep 'ASN1 OID: secp384r1'
+```
 
-openssl pkey -in mkosi.key -text -noout | grep secp384r1
+### 2) Create signing certificate
 
-
-You should see:
-
-ASN1 OID: secp384r1
-
-2. Create Signing Certificate
+```sh
 openssl req \
   -new -x509 \
   -key mkosi.key \
   -subj "/CN=mkosi" \
   -days 3650 \
   -out mkosi.crt
+```
 
-3. Create Encrypted Offline Backup (CRITICAL)
+### 3) Create encrypted offline backup
 
-Encrypt private key:
-
-openssl enc -aes-256-cbc -pbkdf2 \
+```sh
+openssl enc -aes-256-cbc -pbkdf2 -salt \
   -in mkosi.key \
   -out mkosi.key.enc
+```
 
+Store these offline:
+- `mkosi.key.enc`
+- `mkosi.crt`
 
-Then securely remove plaintext key:
+Then remove plaintext `mkosi.key`:
 
-shred -u mkosi.key
+```sh
+rm -f mkosi.key
+```
 
+Note: secure deletion is not guaranteed on APFS/SSD. Use the hardened RAM-disk
+workflow below if you want to avoid plaintext key material on persistent storage.
 
-Store offline:
+### 4) Prepare each YubiKey
 
-mkosi.key.enc
+Run this for YubiKey #1, then repeat for YubiKey #2:
 
-mkosi.crt
-
-Recommended storage:
-
-Encrypted USB stored physically secure
-
-Password manager attachment
-
-Offline encrypted archive
-
-4. Prepare Each YubiKey
-
-Insert YubiKey #1.
-
-Change Default PIN
-
-(Default is 123456)
-
+```sh
 ykman piv access change-pin
-
-Change Default PUK (Recommended)
 ykman piv access change-puk
-
-Change Management Key (Very Important)
 ykman piv access change-management-key --generate --protect
+```
 
+`--protect` ties the management key to the PIN.
 
---protect ties the management key to your PIN.
+### 5) Import key and certificate to slot 9c
 
-Repeat this entire section for YubiKey #2.
+Temporarily decrypt:
 
-5. Import Key into Slot 9c (Digital Signature)
-
-Temporarily decrypt backup:
-
+```sh
 openssl enc -d -aes-256-cbc -pbkdf2 \
   -in mkosi.key.enc \
   -out mkosi.key
+```
 
+Import to YubiKey #1:
 
-Import to slot 9c:
-
+```sh
 ykman piv keys import 9c mkosi.key
 ykman piv certificates import 9c mkosi.crt
+```
 
+Remove plaintext key:
 
-Securely remove plaintext key again:
+```sh
+rm -f mkosi.key
+```
 
-shred -u mkosi.key
+Repeat decrypt/import/remove for YubiKey #2.
 
+### 6) Verify certificate and key identity on both YubiKeys
 
-Repeat for YubiKey #2.
+Export cert from YubiKey #1:
 
-Now both tokens contain the exact same private key.
-
-6. Verify Key Algorithm (ECC P-384)
-
-Export certificate:
-
+```sh
 ykman piv certificates export 9c cert.pem
+```
 
+Check algorithm:
 
-Verify algorithm:
+```sh
+openssl x509 -in cert.pem -text -noout | grep -A2 'Public Key Algorithm'
+```
 
-openssl x509 -in cert.pem -text -noout | grep -A2 "Public Key Algorithm"
+Expected:
+- `Public Key Algorithm: id-ecPublicKey`
+- `ASN1 OID: secp384r1`
 
+Record fingerprint from YubiKey #1:
 
-Expected output:
-
-Public Key Algorithm: id-ecPublicKey
-ASN1 OID: secp384r1
-
-7. Verify Both YubiKeys Contain Identical Key
-
-With YubiKey #1 inserted:
-
+```sh
 openssl x509 -in cert.pem -noout -fingerprint -sha256
+```
 
+Insert YubiKey #2, export certificate again, and compare fingerprints. They must
+match exactly.
 
-Copy fingerprint.
+### 7) Verify PKCS#11 visibility
 
-Insert YubiKey #2 and repeat.
-
-Fingerprints must match exactly.
-
-If they match → both tokens contain the same key.
-
-8. Verify PKCS#11 Access (Required for mkosi)
-
-List certificate objects:
-
+```sh
 pkcs11-tool \
-  --module /opt/homebrew/lib/opensc-pkcs11.so \
+  --module "$OPENSC_P11" \
   --list-objects --type cert
+```
 
+Confirm output includes:
+- token label (for example `token=mkosi`)
+- key ID `02`
+- URI with `id=%02`
 
-Expected output includes:
+If your URI has a different token label, use that value in `mkosi.local.conf`
+instead of `mkosi`.
 
-token=mkosi
+### 8) Optional signing smoke test
 
-ID: 02
+Create test data and digest:
 
-URI line
+```sh
+echo 'particleos test' > test.txt
+openssl dgst -sha384 -binary test.txt > test.sha384
+```
 
-Example:
+Sign digest with YubiKey private key (`id 02`):
 
-token=mkosi;id=%02;type=cert
-
-9. Test Private Key Signing (Important)
-
-Create test file:
-
-echo "particleos test" > test.txt
-
-
-Sign:
-
+```sh
 pkcs11-tool \
-  --module /opt/homebrew/lib/opensc-pkcs11.so \
+  --module "$OPENSC_P11" \
+  --login \
   --sign \
   --id 02 \
   --mechanism ECDSA \
-  --input-file test.txt \
+  --input-file test.sha384 \
   --output-file sig.bin
+```
 
+For P-384, raw ECDSA signature output is typically 96 bytes:
 
-Verify:
+```sh
+wc -c sig.bin
+```
 
-openssl dgst -sha384 \
-  -verify <(openssl x509 -in cert.pem -pubkey -noout) \
-  -signature sig.bin \
-  test.txt
+Clean test artifacts:
 
+```sh
+rm -f test.txt test.sha384 sig.bin cert.pem
+```
 
-Expected result:
+## `mkosi.local.conf` settings for this repo
 
-Verified OK
+This repository uses full PKCS#11 settings for Secure Boot, PCR signing, and
+verity signing:
 
-
-This confirms:
-
-Private key works
-
-ECC P-384 signing works
-
-PKCS#11 works
-
-mkosi will work
-
-10. mkosi.local.conf Configuration
-
-Based on:
-
-token=mkosi
-id=02
-
-
-Use:
-
+```conf
 [Validation]
 SecureBootKey=pkcs11:token=mkosi;id=%%02;type=private
 SecureBootKeySource=provider:pkcs11
 SecureBootCertificate=pkcs11:token=mkosi;id=%%02;type=cert
 SecureBootCertificateSource=provider:pkcs11
+SignExpectedPcrKey=pkcs11:token=mkosi;id=%%02;type=private
+SignExpectedPcrKeySource=provider:pkcs11
+SignExpectedPcrCertificate=pkcs11:token=mkosi;id=%%02;type=cert
+SignExpectedPcrCertificateSource=provider:pkcs11
+VerityKey=pkcs11:token=mkosi;id=%%02;type=private
+VerityKeySource=provider:pkcs11
+VerityCertificate=pkcs11:token=mkosi;id=%%02;type=cert
+VerityCertificateSource=provider:pkcs11
+```
 
+Important: `%%02` (double `%`) is required in `mkosi.local.conf`.
 
-Note: %%02 (double %) is required.
+## Restore from backup
 
-Restoring From Backup
+If a token is lost or damaged:
 
-If a YubiKey is lost or damaged:
-
-Decrypt backup:
-
+```sh
 openssl enc -d -aes-256-cbc -pbkdf2 \
   -in mkosi.key.enc \
   -out mkosi.key
 
-
-Import to replacement YubiKey:
-
 ykman piv keys import 9c mkosi.key
 ykman piv certificates import 9c mkosi.crt
 
+rm -f mkosi.key
+```
 
-Securely remove plaintext:
+This restores the same signing identity on the replacement token.
 
-shred -u mkosi.key
+## Hardened workflow: no plaintext key on persistent disk
 
+Use a RAM disk so plaintext private key material does not persist on disk.
 
-The new token will now behave identically.
+### 1) Create RAM disk
 
-Security Checklist
-
-✔ ECC P-384 used
-✔ Same key on both YubiKeys
-✔ Encrypted offline backup exists
-✔ Plaintext key shredded
-✔ PIN changed
-✔ Management key replaced
-✔ PKCS#11 verified
-✔ Signing tested
-
-Optional Hardening (Advanced)
-
-Generate key inside a RAM disk
-
-Store backup in encrypted archive (e.g. age or GPG)
-
-Maintain third sealed backup token
-
-Enroll certificate into UEFI Secure Boot chain
-
-
-----------
-
-
-Excellent — now we’re moving into serious territory.
-
-Below are two sections you can append to your README:
-
-Hardened “no-plaintext-on-disk” workflow (macOS)
-
-Secure Boot disaster recovery model (real-world operational plan)
-
-This assumes:
-
-ECC P-384
-
-Two YubiKeys
-
-You control Secure Boot keys (custom PK/KEK/db)
-
-🔐 Hardened Key Generation (No Plaintext on Disk)
-
-Goal:
-The private key never touches persistent storage unencrypted.
-
-We’ll use a RAM disk on macOS.
-
-1️⃣ Create Temporary RAM Disk
-
-Create 16MB RAM disk:
-
+```sh
 RAMDISK=$(hdiutil attach -nomount ram://32768)
-diskutil erasevolume APFS RAMDisk $RAMDISK
+diskutil erasevolume APFS RAMDisk "$RAMDISK"
+```
 
+### 2) Generate key and cert on RAM disk
 
-Mount point will be:
-
-/Volumes/RAMDisk
-
-
-All key material will exist only here.
-
-2️⃣ Generate ECC P-384 Key in RAM
+```sh
 cd /Volumes/RAMDisk
 
 openssl genpkey \
@@ -349,243 +279,78 @@ openssl genpkey \
   -pkeyopt ec_param_enc:named_curve \
   -out mkosi.key
 
-3️⃣ Create Certificate
 openssl req \
   -new -x509 \
   -key mkosi.key \
   -subj "/CN=mkosi" \
   -days 3650 \
   -out mkosi.crt
+```
 
-4️⃣ Immediately Create Encrypted Backup (to persistent disk)
+### 3) Save encrypted backup and certificate to secure storage
 
-Choose a secure destination (external encrypted drive recommended):
+```sh
+mkdir -p ~/secure-storage
 
-openssl enc -aes-256-cbc -pbkdf2 \
+openssl enc -aes-256-cbc -pbkdf2 -salt \
   -in mkosi.key \
   -out ~/secure-storage/mkosi.key.enc
 
-
-Copy certificate:
-
 cp mkosi.crt ~/secure-storage/
+```
 
+### 4) Import to YubiKey #1 and #2
 
-Now the only plaintext key is in RAM.
-
-5️⃣ Import into YubiKey #1
+```sh
 ykman piv keys import 9c mkosi.key
 ykman piv certificates import 9c mkosi.crt
+```
 
-6️⃣ Import into YubiKey #2
+Swap token and repeat.
 
-Insert second key and repeat:
+### 5) Destroy RAM disk
 
-ykman piv keys import 9c mkosi.key
-ykman piv certificates import 9c mkosi.crt
-
-7️⃣ Destroy RAM Disk (Key Gone Forever)
+```sh
 cd ~
 hdiutil detach /Volumes/RAMDisk
+```
 
+## Disaster recovery model
 
-At this point:
+### Scenario 1: one YubiKey lost
 
-Private key never existed unencrypted on disk
+No Secure Boot enrollment change is required.
+- continue signing with remaining token
+- provision replacement from `mkosi.key.enc`
 
-Only encrypted backup remains
+### Scenario 2: both YubiKeys lost, backup exists
 
-Both YubiKeys contain identical key
+No Secure Boot enrollment change is required.
+- restore from `mkosi.key.enc`
+- import into replacement token(s)
 
-This is extremely clean operationally.
+### Scenario 3: both YubiKeys lost, backup lost
 
-🧨 Secure Boot Disaster Recovery Model
+Signing identity is permanently lost.
+- generate new signing key
+- use offline KEK to update `db`
+- enroll new signing certificate
 
-Now the important part: what happens if:
+## Key rotation policy (recommended)
 
-You lose one YubiKey?
+Rotate signing keys every 2-3 years:
+- generate new db signing key
+- temporarily trust old + new certs in `db`
+- migrate builds to new key
+- remove old cert from `db`
+- archive and revoke old material as appropriate
 
-You lose both?
+## Recommended secure boot key repository layout
 
-A token fails?
+Store this on encrypted removable media or encrypted vault storage, not in your
+normal home directory.
 
-You rotate keys?
-
-Firmware update bricks db?
-
-You need a trust hierarchy model.
-
-🔐 Recommended Secure Boot Architecture
-
-Think in 3 tiers:
-
-PK   (Platform Key – Root of Trust)
- └── KEK (Key Exchange Key)
-      └── db (Allowed Signing Keys)
-            └── mkosi signing cert
-
-
-Your YubiKey holds the mkosi signing key (db-level signing key).
-
-It should NOT hold:
-
-PK
-
-KEK
-
-Those should be offline-only.
-
-🛡 Recommended Key Roles
-Key	Where Stored	Usage
-PK	Offline encrypted storage only	Own platform
-KEK	Offline encrypted storage only	Authorize db updates
-mkosi signing key	YubiKey (x2)	Sign OS images
-
-Never mix these roles.
-
-🔄 Disaster Scenarios
-🟢 Scenario 1: One YubiKey Lost
-
-Nothing breaks.
-
-Use second YubiKey
-
-Immediately provision replacement
-
-Restore from mkosi.key.enc
-
-Procedure:
-
-Decrypt backup
-
-Import to new YubiKey
-
-Destroy plaintext
-
-Zero Secure Boot changes required.
-
-🟡 Scenario 2: Both YubiKeys Lost BUT Backup Exists
-
-Still safe.
-
-Restore key from encrypted backup
-
-Provision new YubiKeys
-
-Continue signing
-
-Secure Boot chain unaffected.
-
-🔴 Scenario 3: Backup Lost + Both YubiKeys Lost
-
-Now signing key is gone permanently.
-
-Systems already enrolled with that db certificate will:
-
-Continue booting old images
-
-Refuse new images signed with new key
-
-Recovery requires:
-
-Generate new signing key
-
-Use KEK to update db
-
-Enroll new signing certificate
-
-This is why KEK must be preserved offline.
-
-🧠 Recommended Recovery Strategy
-
-Keep:
-
-1 encrypted backup of mkosi.key
-
-1 offline copy of KEK private key
-
-1 offline copy of PK private key
-
-Store in:
-
-Separate physical locations
-
-Encrypted storage
-
-Printed fingerprint sheet in safe
-
-🔁 Key Rotation Model (Professional Setup)
-
-Every 2–3 years:
-
-Generate new mkosi signing key
-
-Sign new images with both old + new keys temporarily
-
-Update db to include new key
-
-Remove old key from db
-
-Destroy old key material
-
-This avoids hard cutovers.
-
-🔐 Maximum Paranoia Mode (Optional)
-
-For high assurance:
-
-Third YubiKey stored offsite
-
-KEK stored in separate HSM
-
-PK stored offline air-gapped
-
-Shamir Secret Sharing for PK backup
-
-Maintain printed SHA256 fingerprints
-
-🧱 Practical Minimal Safe Setup
-
-For most secure homelab / production setups:
-
-✔ 2 signing YubiKeys
-✔ 1 encrypted backup
-✔ Offline KEK private key
-✔ Offline PK private key
-✔ Printed fingerprints
-✔ Secure storage in separate locations
-
-That gives you:
-
-Hardware compromise resistance
-
-Disaster survivability
-
-Recoverability
-
-No single point of failure
-
-
-
-------------
-
-
-
-🔐 Recommended Secure Boot Key Repository Layout
-
-This repository should live:
-
-On an encrypted external drive
-
-Or inside an encrypted vault (VeraCrypt / LUKS / FileVault disk image)
-
-Never in your normal home directory
-
-Example root:
-
-secureboot/
-
-📂 Top-Level Structure
+```text
 secureboot/
 ├── README.md
 ├── fingerprints/
@@ -595,200 +360,11 @@ secureboot/
 ├── backups/
 ├── revoked/
 └── rotation/
+```
 
-📄 README.md
+Suggested structure:
 
-Human-readable document describing:
-
-Key purpose
-
-Creation dates
-
-Expiry dates
-
-Where physical backups are stored
-
-Recovery procedure summary
-
-This becomes critical in 3 years.
-
-🔎 fingerprints/
-
-Contains printable, immutable references.
-
-fingerprints/
-├── pk.sha256
-├── kek.sha256
-├── db.sha256
-├── mkosi_signing.sha256
-
-
-Generate like:
-
-openssl x509 -in db/db.crt -noout -fingerprint -sha256 > fingerprints/db.sha256
-
-
-Print these and store physically.
-
-👑 pk/ (Platform Key – Root of Trust)
-
-Highest authority. Rarely used.
-
-pk/
-├── private/
-│   └── pk.key.enc
-├── certs/
-│   └── pk.crt
-├── esl/
-│   └── pk.esl
-└── auth/
-    └── pk.auth
-
-
-Rules:
-
-pk.key.enc = encrypted private key only
-
-Never keep plaintext pk.key
-
-This key should almost never be decrypted
-
-🔑 kek/ (Key Exchange Key)
-
-Used to authorize db updates.
-
-kek/
-├── private/
-│   └── kek.key.enc
-├── certs/
-│   └── kek.crt
-├── esl/
-│   └── kek.esl
-└── auth/
-    └── kek.auth
-
-
-Used only when:
-
-Rotating db keys
-
-Adding new signing keys
-
-Revoking compromised ones
-
-🖊 db/ (Allowed Signing Keys)
-
-Contains OS signing certificates.
-
-db/
-├── active/
-│   └── mkosi_signing.crt
-├── private-backup/
-│   └── mkosi.key.enc
-├── esl/
-│   └── db.esl
-└── auth/
-    └── db.auth
-
-
-Important:
-
-mkosi_signing.crt = certificate enrolled in firmware
-
-mkosi.key.enc = encrypted backup of YubiKey key
-
-No plaintext private keys here
-
-🚫 revoked/
-
-For compromised keys.
-
-revoked/
-├── old_mkosi_signing.crt
-├── dbx.esl
-└── dbx.auth
-
-
-If you rotate keys, archive old certs here.
-
-Never delete revoked material.
-
-🔁 rotation/
-
-For future key rollovers.
-
-rotation/
-├── 2026-rotation/
-│   ├── new_db.crt
-│   ├── transition_notes.md
-│   └── timeline.md
-
-
-Keep rotation isolated and documented.
-
-💾 backups/
-
-Metadata about physical storage locations.
-
-backups/
-├── storage-locations.md
-├── recovery-playbook.md
-
-
-Example storage-locations.md:
-
-Encrypted USB #1 – Safe at home
-Encrypted USB #2 – Bank safe deposit box
-YubiKey #1 – Daily carry
-YubiKey #2 – Fireproof safe
-
-🔒 Encryption Standard Recommendation
-
-Always encrypt private keys like this:
-
-openssl enc -aes-256-cbc -pbkdf2 \
-  -in pk.key \
-  -out pk.key.enc
-
-
-Then:
-
-shred -u pk.key
-
-
-Never store plaintext.
-
-🧠 Separation of Duties Model
-
-Best practice:
-
-Key	Storage	Usage Frequency
-PK	Offline only	Almost never
-KEK	Offline only	Rare
-db signing	YubiKey	Regular
-db backup	Encrypted file	Emergency only
-
-Never keep PK, KEK, and db private keys on same device.
-
-📌 Practical Minimal Setup
-
-If you're running ParticleOS for serious systems:
-
-2 signing YubiKeys
-
-1 encrypted signing key backup
-
-Offline KEK key
-
-Offline PK key
-
-Printed fingerprints
-
-Encrypted storage in two locations
-
-This eliminates single-point-of-failure risk.
-
-🧱 Example Final Layout Snapshot
+```text
 secureboot/
 ├── pk/
 │   ├── private/pk.key.enc
@@ -809,6 +385,26 @@ secureboot/
 ├── revoked/
 ├── rotation/
 └── backups/
+```
 
+Recommended fingerprint records:
+- `fingerprints/pk.sha256`
+- `fingerprints/kek.sha256`
+- `fingerprints/db.sha256`
+- `fingerprints/mkosi_signing.sha256`
 
-Clean. Auditable. Recoverable.
+Example:
+
+```sh
+openssl x509 -in db/active/mkosi_signing.crt -noout -fingerprint -sha256 \
+  > fingerprints/mkosi_signing.sha256
+```
+
+## Minimal safe baseline
+
+- two signing YubiKeys with identical key material
+- encrypted backup of signing key (`mkosi.key.enc`)
+- offline KEK private key backup
+- offline PK private key backup
+- printed SHA-256 fingerprints stored separately
+- backups stored in at least two physical locations
